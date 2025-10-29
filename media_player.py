@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
+from enum import StrEnum
 import hashlib
 import logging
 import os
+from pathlib import Path
 from socket import gaierror
 from typing import Any
 
@@ -19,6 +21,7 @@ from homeassistant.components import media_source
 from homeassistant.components.media_player import (
     PLATFORM_SCHEMA as MEDIA_PLAYER_PLATFORM_SCHEMA,
     BrowseMedia,
+    MediaClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
@@ -26,7 +29,9 @@ from homeassistant.components.media_player import (
     RepeatMode,
     async_process_play_media_url,
 )
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PASSWORD, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
@@ -36,7 +41,7 @@ from homeassistant.util import Throttle, dt as dt_util
 
 from .const import DOMAIN, LOGGER
 
-DEFAULT_NAME = "MPD"
+DEFAULT_NAME = "MPD2"
 DEFAULT_PORT = 6600
 
 PLAYLIST_UPDATE_INTERVAL = timedelta(seconds=120)
@@ -66,25 +71,80 @@ PLATFORM_SCHEMA = MEDIA_PLAYER_PLATFORM_SCHEMA.extend(
     }
 )
 
+class MpdMediaType(StrEnum):
+    ALBUM = "Album"
+    ARTIST = "Artist"
+    GENRE = "Genre"
+    TITLE = "Title"
+    FILES = "Files"
+    PLAYLISTS = "Playlists"
+    TAGS = "Tags"
 
-async def async_setup_entry(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddConfigEntryEntitiesCallback,
-) -> None:
-    """Set up media player from config_entry."""
+_MEDIA_TYPE_TO_TITLE = {
+    MpdMediaType.ALBUM  : "By Album",
+    MpdMediaType.ARTIST : "By Artist",
+    MpdMediaType.GENRE  : "By Genre",
+    MpdMediaType.TITLE  : "By Title",
+    MpdMediaType.FILES  : "Files",
+    MpdMediaType.PLAYLISTS : "Playlists",
+    MpdMediaType.TAGS   : "Tags"
+}
 
-    async_add_entities(
-        [
-            MpdDevice(
-                entry.data[CONF_HOST],
-                entry.data[CONF_PORT],
-                entry.data.get(CONF_PASSWORD),
-                entry.entry_id,
-            )
-        ],
-        True,
+_MEDIA_TYPE_TO_TAG = {
+    MpdMediaType.ALBUM  : "AlbumSort",
+    MpdMediaType.ARTIST : "ArtistSort",
+    MpdMediaType.GENRE  : "Genre",
+    MpdMediaType.TITLE  : "Title" # NOTE: "TitleSort" is not working
+}
+_SEP = "|||"
+
+def _to_browse_media(info : dict | str, media_type:MpdMediaType, parent:str|None = None) -> BrowseMedia:
+    media_class = MediaClass.DIRECTORY
+    content = ""
+
+    if isinstance(info, dict):
+        if "directory" in info:
+            media_class = MediaClass.DIRECTORY
+            content = info["directory"]
+        elif "file" in info:
+            media_class = MediaClass.MUSIC
+            content = info["file"]
+        elif "playlist" in info:
+            media_class = MediaClass.PLAYLIST
+            content = info["playlist"]
+        elif parent and parent.lower() in info:
+            media_class = MediaClass.DIRECTORY
+            content = info[parent.lower()]
+        else:
+            LOGGER.error(f"Unknown response from MPD: {info}")
+            raise HomeAssistantError("Unknown response from MPD", info)
+    else:
+        media_class = MediaClass.DIRECTORY
+        content = info
+
+    return BrowseMedia(
+        media_class=media_class,
+        media_content_id=content if not parent else f"{content}{_SEP}{parent}",
+        media_content_type=media_type,
+        title=Path(content).name,
+        can_play=media_class in [MediaClass.MUSIC, MediaClass.PLAYLIST],
+        can_expand=media_class == MediaClass.DIRECTORY,
+        children_media_class=None,
+        children=[],
     )
+
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
+    mpd = MpdDevice(
+        config[CONF_NAME],
+        config[CONF_HOST],
+        config[CONF_PORT],
+        config.get(CONF_PASSWORD))
+    async_add_entities([mpd])
 
 
 class MpdDevice(MediaPlayerEntity):
@@ -95,18 +155,18 @@ class MpdDevice(MediaPlayerEntity):
     _attr_name = None
 
     def __init__(
-        self, server: str, port: int, password: str | None, unique_id: str
+        self, name: str, server: str, port: int, password: str | None
     ) -> None:
         """Initialize the MPD device."""
         self.server = server
         self.port = port
-        self._attr_unique_id = unique_id
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, unique_id)},
+            identifiers={(DOMAIN, name)},
             entry_type=DeviceEntryType.SERVICE,
         )
         self.password = password
 
+        self._attr_name = name
         self._status: dict[str, Any] = {}
         self._currentsong = None
         self._current_playlist: str | None = None
@@ -536,11 +596,73 @@ class MpdDevice(MediaPlayerEntity):
         media_content_id: str | None = None,
     ) -> BrowseMedia:
         """Implement the websocket media browsing helper."""
-        async with self.connection():
-            return await media_source.async_browse_media(
-                self.hass,
-                media_content_id,
-                content_filter=lambda item: item.media_content_type.startswith(
-                    "audio/"
-                ),
+        mt = media_content_type
+        if mt is None:
+            _mk_browse_media = lambda content_type, children: BrowseMedia(
+                media_class=MediaClass.DIRECTORY,
+                media_content_id="",
+                media_content_type=content_type,
+                title=_MEDIA_TYPE_TO_TITLE[content_type],
+                can_play=False,
+                can_expand=True,
+                children_media_class=None,
+                children=children
             )
+
+            items = [ _mk_browse_media(t, []) for t in MpdMediaType]
+            val = _mk_browse_media(MpdMediaType.ALBUM, items)
+            return val
+
+        match mt:
+            case MpdMediaType.FILES:
+                async with self.connection():
+                    return BrowseMedia(
+                        media_class=MediaClass.DIRECTORY,
+                        media_content_id=media_content_id or "",
+                        media_content_type=MpdMediaType.FILES,
+                        title=media_content_id if media_content_id else "Files",
+                        can_play=False,
+                        can_expand=True,
+                        children_media_class=MediaClass.MUSIC,
+                        children=[_to_browse_media(x, mt) for x in await self._client.lsinfo(media_content_id)],
+                    )
+            case MpdMediaType.ALBUM | MpdMediaType.GENRE | MpdMediaType.TITLE | MpdMediaType.ARTIST | MpdMediaType.TAGS:
+                parent = None
+                if not media_content_id and mt == MpdMediaType.TAGS:
+                    # get all tags
+                    finder = lambda: self._client.tagtypes()
+                    content = media_content_id
+                else:
+                    if not media_content_id:
+                        # Get tag by media type
+                        content = _MEDIA_TYPE_TO_TAG[mt]
+                        id_parts = [content]
+                    else:
+                        # Already has tag from previous step. Just extract it
+                        id_parts = media_content_id.split(_SEP)
+                        content = id_parts[0]
+
+                    if len(id_parts) > 1: # has parent part (tag name and context)
+                        parent = id_parts[1]
+                        # get items by tag and gat's category name
+                        finder = lambda: self._client.find(parent, content)
+                    else:
+                        # get items by tag
+                        finder = lambda: self._client.list(content)
+
+                async with self.connection():
+                    try:
+                        return BrowseMedia(
+                            media_class=MediaClass.DIRECTORY,
+                            media_content_id=content or "",
+                            media_content_type=MpdMediaType.TAGS,
+                            title=content if content else "Tags",
+                            can_play=False,
+                            can_expand=True,
+                            children_media_class=None,
+                            children=[_to_browse_media(x, mt, content) for x in await finder()],
+                        )
+                    except Exception as ex:
+                        raise HomeAssistantError(f"Failed to fetch data: {str(ex)}") from ex
+            case _:
+                raise HomeAssistantError(f"Unknown media content type: {mt}")
