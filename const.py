@@ -2,6 +2,6 @@
 
 import logging
 
-DOMAIN = "mpd"
+DOMAIN = "mpd2"
 
 LOGGER = logging.getLogger(__package__)
