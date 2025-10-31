@@ -72,12 +72,13 @@ PLATFORM_SCHEMA = MEDIA_PLAYER_PLATFORM_SCHEMA.extend(
 )
 
 class MpdMediaType(StrEnum):
+    FILES = "Files"
     ALBUM = "Album"
     ARTIST = "Artist"
     GENRE = "Genre"
     TITLE = "Title"
-    FILES = "Files"
     PLAYLISTS = "Playlists"
+    CURRENT_PLAYLIST = "Playlist"
     TAGS = "Tags"
 
 _MEDIA_TYPE_TO_TITLE = {
@@ -87,7 +88,9 @@ _MEDIA_TYPE_TO_TITLE = {
     MpdMediaType.TITLE  : "By Title",
     MpdMediaType.FILES  : "Files",
     MpdMediaType.PLAYLISTS : "Playlists",
-    MpdMediaType.TAGS   : "Tags"
+    MpdMediaType.TAGS   : "Tags",
+    MpdMediaType.CURRENT_PLAYLIST : "Current Playlist",
+    None : "Media Player Daemon"
 }
 
 _MEDIA_TYPE_TO_TAG = {
@@ -96,42 +99,8 @@ _MEDIA_TYPE_TO_TAG = {
     MpdMediaType.GENRE  : "Genre",
     MpdMediaType.TITLE  : "Title" # NOTE: "TitleSort" is not working
 }
+
 _SEP = "|||"
-
-def _to_browse_media(info : dict | str, media_type:MpdMediaType, parent:str|None = None) -> BrowseMedia:
-    media_class = MediaClass.DIRECTORY
-    content = ""
-
-    if isinstance(info, dict):
-        if "directory" in info:
-            media_class = MediaClass.DIRECTORY
-            content = info["directory"]
-        elif "file" in info:
-            media_class = MediaClass.MUSIC
-            content = info["file"]
-        elif "playlist" in info:
-            media_class = MediaClass.PLAYLIST
-            content = info["playlist"]
-        elif parent and parent.lower() in info:
-            media_class = MediaClass.DIRECTORY
-            content = info[parent.lower()]
-        else:
-            LOGGER.error(f"Unknown response from MPD: {info}")
-            raise HomeAssistantError("Unknown response from MPD", info)
-    else:
-        media_class = MediaClass.DIRECTORY
-        content = info
-
-    return BrowseMedia(
-        media_class=media_class,
-        media_content_id=content if not parent else f"{content}{_SEP}{parent}",
-        media_content_type=media_type,
-        title=Path(content).name,
-        can_play=media_class in [MediaClass.MUSIC, MediaClass.PLAYLIST],
-        can_expand=media_class == MediaClass.DIRECTORY,
-        children_media_class=None,
-        children=[],
-    )
 
 async def async_setup_platform(
     hass: HomeAssistant,
@@ -513,6 +482,10 @@ class MpdDevice(MediaPlayerEntity):
         self, media_type: MediaType | str, media_id: str, **kwargs: Any
     ) -> None:
         """Send the media player the command for playing a playlist."""
+
+        if media_id:
+            media_id = media_id.split(_SEP)[0]
+
         async with self.connection():
             if media_source.is_media_source_id(media_id):
                 media_type = MediaType.MUSIC
@@ -597,72 +570,75 @@ class MpdDevice(MediaPlayerEntity):
     ) -> BrowseMedia:
         """Implement the websocket media browsing helper."""
         mt = media_content_type
-        if mt is None:
-            _mk_browse_media = lambda content_type, children: BrowseMedia(
-                media_class=MediaClass.DIRECTORY,
-                media_content_id="",
-                media_content_type=content_type,
-                title=_MEDIA_TYPE_TO_TITLE[content_type],
-                can_play=False,
-                can_expand=True,
-                children_media_class=None,
-                children=children
-            )
+        title = media_content_id or _MEDIA_TYPE_TO_TITLE[mt]
 
-            items = [ _mk_browse_media(t, []) for t in MpdMediaType]
-            val = _mk_browse_media(MpdMediaType.ALBUM, items)
-            return val
+        async with self.connection():
+            try:
+                match mt:
+                    case None: # Show all categories
+                        children = [_to_browse_media(_MEDIA_TYPE_TO_TITLE[t], t, empty_content_id=True) for t in MpdMediaType]
 
-        match mt:
-            case MpdMediaType.FILES:
-                async with self.connection():
-                    return BrowseMedia(
-                        media_class=MediaClass.DIRECTORY,
-                        media_content_id=media_content_id or "",
-                        media_content_type=MpdMediaType.FILES,
-                        title=media_content_id if media_content_id else "Files",
-                        can_play=False,
-                        can_expand=True,
-                        children_media_class=MediaClass.MUSIC,
-                        children=[_to_browse_media(x, mt) for x in await self._client.lsinfo(media_content_id)],
-                    )
-            case MpdMediaType.ALBUM | MpdMediaType.GENRE | MpdMediaType.TITLE | MpdMediaType.ARTIST | MpdMediaType.TAGS:
-                parent = None
-                if not media_content_id and mt == MpdMediaType.TAGS:
-                    # get all tags
-                    finder = lambda: self._client.tagtypes()
-                    content = media_content_id
-                else:
-                    if not media_content_id:
-                        # Get tag by media type
-                        content = _MEDIA_TYPE_TO_TAG[mt]
-                        id_parts = [content]
-                    else:
-                        # Already has tag from previous step. Just extract it
-                        id_parts = media_content_id.split(_SEP)
-                        content = id_parts[0]
+                    case MpdMediaType.FILES: ## set title
+                        children=[_to_browse_media(x, mt) for x in await self._client.lsinfo(media_content_id)]
 
-                    if len(id_parts) > 1: # has parent part (tag name and context)
-                        parent = id_parts[1]
-                        # get items by tag and gat's category name
-                        finder = lambda: self._client.find(parent, content)
-                    else:
-                        # get items by tag
-                        finder = lambda: self._client.list(content)
+                    case MpdMediaType.CURRENT_PLAYLIST:
+                        children=[_to_browse_media(x, mt) for x in await self._client.playlistinfo()]
 
-                async with self.connection():
-                    try:
-                        return BrowseMedia(
-                            media_class=MediaClass.DIRECTORY,
-                            media_content_id=content or "",
-                            media_content_type=MpdMediaType.TAGS,
-                            title=content if content else "Tags",
-                            can_play=False,
-                            can_expand=True,
-                            children_media_class=None,
-                            children=[_to_browse_media(x, mt, content) for x in await finder()],
-                        )
-                    except Exception as ex:
-                        raise HomeAssistantError(f"Failed to fetch data: {str(ex)}") from ex
-            case _:
-                raise HomeAssistantError(f"Unknown media content type: {mt}")
+                    case  MpdMediaType.TAGS if not media_content_id: # Get all tags
+                        children=[_to_browse_media(x, mt) for x in await self._client.tagtypes()]
+
+                    case MpdMediaType.TAGS if _SEP not in media_content_id: # Get all categories by given tag
+                        children=[_to_browse_media(x, mt, media_content_id) for x in await self._client.list(media_content_id)]
+
+                    case MpdMediaType.ALBUM | MpdMediaType.GENRE | MpdMediaType.TITLE | MpdMediaType.ARTIST if not media_content_id:
+                        tag = _MEDIA_TYPE_TO_TAG[mt]
+                        children=[_to_browse_media(x, mt, tag) for x in await self._client.list(tag)]
+
+                    case MpdMediaType.ALBUM | MpdMediaType.GENRE | MpdMediaType.TITLE | MpdMediaType.ARTIST | MpdMediaType.TAGS:
+                        title, category = media_content_id.split(_SEP)
+                        children=[_to_browse_media(x, mt, title) for x in await self._client.find(category, title)]
+
+                    case _:
+                        raise HomeAssistantError(f"Unknown media content type: {mt}")
+                return _to_browse_media(title, mt, empty_content_id=True, children=children)
+            except Exception as ex:
+                if isinstance(ex, HomeAssistantError):
+                    raise
+                raise HomeAssistantError(f"Failed to fetch data: {str(ex)}") from ex
+
+def _to_browse_media(info : dict | str, media_type:MpdMediaType, parent:str|None = None, empty_content_id = False, children = []) -> BrowseMedia:
+    media_class = MediaClass.DIRECTORY
+    content = info
+
+    if isinstance(info, dict):
+        if "directory" in info:
+            media_class = MediaClass.DIRECTORY
+            content = info["directory"]
+        elif "file" in info:
+            media_class = MediaClass.MUSIC
+            content = info["file"]
+        elif "playlist" in info:
+            media_class = MediaClass.PLAYLIST
+            content = info["playlist"]
+        elif parent and parent.lower() in info:
+            media_class = MediaClass.DIRECTORY
+            content = info[parent.lower()]
+        else:
+            LOGGER.error(f"Unknown response from MPD: {info}")
+            raise HomeAssistantError("Unknown response from MPD", info)
+
+    if empty_content_id:
+        content_id = ""
+    else:
+        content_id = content if not parent else f"{content}{_SEP}{parent}"
+
+    return BrowseMedia(
+        media_class=media_class,
+        media_content_id=content_id,
+        media_content_type=media_type,
+        title=Path(content).name,
+        can_play=media_class in [MediaClass.MUSIC, MediaClass.PLAYLIST],
+        can_expand=media_class == MediaClass.DIRECTORY,
+        children_media_class=None,
+        children=children,
+    )
