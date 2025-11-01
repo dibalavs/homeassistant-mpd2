@@ -41,6 +41,13 @@ from homeassistant.util import Throttle, dt as dt_util
 
 from .const import DOMAIN, LOGGER
 
+EVENT_NAME = f"{DOMAIN}_event"
+EVENT_TYPE_STATE_CHANGED = "state_changed" # {"prev" : <MediaPlayerState>, "curr" : <MediaPlayerState>}
+EVENT_TYPE_CURRNENT_SONG_CHANGED = "current_song_changed" # {"prev" : <str>, "curr" : <str>}
+EVENT_TYPE_PLAYLIST_CHANGED = "playlist_changed" # No playload
+EVENT_TYPE_LIST_PLAYLISTS_CHANGED = "list_playlists_changed" # {"prev" : <list[str]>, "curr" : <list[str]>}
+EVENT_TYPE_VOLUME_CHANGED = "volume_changed" # {"prev" : <float>, "curr" : <float>}
+
 DEFAULT_NAME = "MPD2"
 DEFAULT_PORT = 6600
 
@@ -109,6 +116,7 @@ async def async_setup_platform(
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
     mpd = MpdDevice(
+        hass,
         config[CONF_NAME],
         config[CONF_HOST],
         config[CONF_PORT],
@@ -124,9 +132,10 @@ class MpdDevice(MediaPlayerEntity):
     _attr_name = None
 
     def __init__(
-        self, name: str, server: str, port: int, password: str | None
+        self, hass: HomeAssistant, name: str, server: str, port: int, password: str | None
     ) -> None:
         """Initialize the MPD device."""
+        self.hass = hass
         self.server = server
         self.port = port
         self._attr_device_info = DeviceInfo(
@@ -139,6 +148,7 @@ class MpdDevice(MediaPlayerEntity):
         self._status: dict[str, Any] = {}
         self._currentsong = None
         self._current_playlist: str | None = None
+        self._playlist_songs: list[str] = []
         self._muted_volume = None
         self._media_image_hash = None
         # Track if the song changed so image doesn't have to be loaded every update.
@@ -149,6 +159,58 @@ class MpdDevice(MediaPlayerEntity):
         self._client.timeout = 30
         self._client.idletimeout = 10
         self._client_lock = asyncio.Lock()
+
+    def _fire_if_state_changed(self, prev:MediaPlayerState, curr:MediaPlayerState):
+        if prev != curr:
+            data = {
+                "entity_id": self.entity_id,
+                "entity_name": self._attr_name,
+                "type": EVENT_TYPE_STATE_CHANGED,
+                "prev": prev,
+                "curr": curr
+            }
+            self.hass.bus.async_fire(EVENT_NAME, data)
+
+    def _fire_if_current_song_changed(self, prev:str, curr:str):
+        if prev != curr:
+            data = {
+                "entity_id": self.entity_id,
+                "entity_name": self._attr_name,
+                "type": EVENT_TYPE_CURRNENT_SONG_CHANGED,
+                "prev": prev,
+                "curr": curr
+            }
+            self.hass.bus.async_fire(EVENT_NAME, data)
+
+    def _fire_if_list_playlists_changed(self, prev:list, curr:list):
+        if prev != curr:
+            data = {
+                "entity_id": self.entity_id,
+                "entity_name": self._attr_name,
+                "type": EVENT_TYPE_LIST_PLAYLISTS_CHANGED,
+                "prev": prev,
+                "curr": curr
+            }
+            self.hass.bus.async_fire(EVENT_NAME, data)
+
+    def _fire_playlist_changed(self):
+        data = {
+            "entity_id": self.entity_id,
+            "entity_name": self._attr_name,
+            "type": EVENT_TYPE_PLAYLIST_CHANGED,
+        }
+        self.hass.bus.async_fire(EVENT_NAME, data)
+
+    def _fire_if_volume_changed(self, prev:int, curr:int):
+        if prev != curr:
+            data = {
+                "entity_id": self.entity_id,
+                "entity_name": self._attr_name,
+                "type": EVENT_TYPE_VOLUME_CHANGED,
+                "prev": int(prev) / 100,
+                "curr": int(curr) / 100
+            }
+            self.hass.bus.async_fire(EVENT_NAME, data)
 
     # Instead of relying on python-mpd2 to maintain a (persistent) connection to
     # MPD, the below explicitly sets up a *non*-persistent connection. This is
@@ -201,8 +263,15 @@ class MpdDevice(MediaPlayerEntity):
         """Get the latest data from MPD and update the state."""
         async with self.connection():
             try:
-                self._status = await self._client.status()
-                self._currentsong = await self._client.currentsong()
+                status = await self._client.status()
+                self._fire_if_state_changed(self._to_state(self._status), self._to_state(status))
+                self._fire_if_volume_changed((self._status or {}).get("volume", 0), (status or {}).get("volume", 0))
+                self._status = status
+
+                song = await self._client.currentsong()
+                self._fire_if_current_song_changed((self._currentsong or {}).get("file"), (song or {}).get("file"))
+                self._currentsong = song
+
                 await self._async_update_media_image_hash()
 
                 if (position := self._status.get("elapsed")) is None:
@@ -219,19 +288,26 @@ class MpdDevice(MediaPlayerEntity):
             except (mpd.ConnectionError, ValueError) as error:
                 LOGGER.debug("Error updating status: %s", error)
 
-    @property
-    def state(self) -> MediaPlayerState:
+    def _to_state(self, state) -> MediaPlayerState:
         """Return the media state."""
-        if not self._status:
+        if not state:
             return MediaPlayerState.OFF
-        if self._status.get("state") == "play":
+
+        state_val = state.get("state")
+
+        if  state_val == "play":
             return MediaPlayerState.PLAYING
-        if self._status.get("state") == "pause":
+        if state_val == "pause":
             return MediaPlayerState.PAUSED
-        if self._status.get("state") == "stop":
+        if state_val == "stop":
             return MediaPlayerState.OFF
 
         return MediaPlayerState.OFF
+
+    @property
+    def state(self) -> MediaPlayerState:
+        """Return the media state."""
+        return self._to_state(self._status)
 
     @property
     def media_content_id(self):
@@ -408,10 +484,21 @@ class MpdDevice(MediaPlayerEntity):
     async def _update_playlists(self, **kwargs: Any) -> None:
         """Update available MPD playlists."""
         try:
+            prev_source_list = self._attr_source_list
+            prev_playlist_songs = self._playlist_songs
+
             self._attr_source_list = []
+            self._playlist_songs = []
             with suppress(mpd.ConnectionError):
                 for playlist_data in await self._client.listplaylists():
                     self._attr_source_list.append(playlist_data["playlist"])
+            self._fire_if_list_playlists_changed(prev_source_list, self._attr_source_list)
+
+            for song in await self._client.playlist():
+                self._playlist_songs.append(song)
+
+            if prev_playlist_songs != self._playlist_songs:
+                    self._fire_playlist_changed()
         except mpd.CommandError as error:
             self._attr_source_list = None
             LOGGER.warning("Playlists could not be updated: %s:", error)
@@ -419,26 +506,30 @@ class MpdDevice(MediaPlayerEntity):
     async def async_set_volume_level(self, volume: float) -> None:
         """Set volume of media player."""
         async with self.connection():
-            if "volume" in self._status:
-                await self._client.setvol(int(volume * 100))
+            prev_volume = self._status.get("volume")
+            if prev_volume is not None:
+                new_volume = int(volume * 100)
+                await self._client.setvol(new_volume)
+                self._status["volume"] = new_volume
 
     async def async_volume_up(self) -> None:
         """Service to send the MPD the command for volume up."""
         async with self.connection():
-            if "volume" in self._status:
-                current_volume = int(self._status["volume"])
+            prev_volume = self._status.get("volume")
+            if prev_volume is not None and int(prev_volume) <= 95:
+                    new_volume = int(prev_volume) + 5
+                    self._client.setvol(new_volume)
+                    self._status["volume"] = new_volume
 
-                if current_volume <= 100:
-                    self._client.setvol(current_volume + 5)
 
     async def async_volume_down(self) -> None:
         """Service to send the MPD the command for volume down."""
         async with self.connection():
-            if "volume" in self._status:
-                current_volume = int(self._status["volume"])
-
-                if current_volume >= 0:
-                    await self._client.setvol(current_volume - 5)
+            prev_volume = self._status.get("volume")
+            if prev_volume is not None and int(prev_volume) >= 5:
+                    new_volume = int(prev_volume) - 5
+                    self._client.setvol(new_volume)
+                    self._status["volume"] = new_volume
 
     async def async_media_play(self) -> None:
         """Service to send the MPD the command for play/pause."""
@@ -509,6 +600,7 @@ class MpdDevice(MediaPlayerEntity):
                 self._current_playlist = None
                 await self._client.add(media_id)
                 await self._client.play()
+            self._fire_playlist_changed()
 
     @property
     def repeat(self) -> RepeatMode:
