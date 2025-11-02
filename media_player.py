@@ -22,6 +22,7 @@ from homeassistant.components.media_player import (
     PLATFORM_SCHEMA as MEDIA_PLAYER_PLATFORM_SCHEMA,
     BrowseMedia,
     MediaClass,
+    MediaPlayerEnqueue,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
@@ -177,8 +178,11 @@ class MpdDevice(MediaPlayerEntity):
                 "entity_id": self.entity_id,
                 "entity_name": self._attr_name,
                 "type": EVENT_TYPE_CURRNENT_SONG_CHANGED,
-                "prev": prev,
-                "curr": curr
+                "prev_media_id": prev,
+                "curr_media_id": curr,
+                "prev_media_title": _media_id_to_title(prev),
+                "curr_media_title": _media_id_to_title(curr),
+
             }
             self.hass.bus.async_fire(EVENT_NAME, data)
 
@@ -312,7 +316,7 @@ class MpdDevice(MediaPlayerEntity):
     @property
     def media_content_id(self):
         """Return the content ID of current playing media."""
-        return self._currentsong.get("file")
+        return (self._currentsong or {}).get("file")
 
     @property
     def media_duration(self):
@@ -573,9 +577,11 @@ class MpdDevice(MediaPlayerEntity):
         self, media_type: MediaType | str, media_id: str, **kwargs: Any
     ) -> None:
         """Send the media player the command for playing a playlist."""
-
         if media_id:
             media_id = media_id.split(_SEP)[0]
+
+        clear_queue = 'enqueue' not in kwargs or kwargs['enqueue'] == MediaPlayerEnqueue.REPLACE
+        start_play = kwargs.get('enqueue', MediaPlayerEnqueue.PLAY) == MediaPlayerEnqueue.PLAY
 
         async with self.connection():
             if media_source.is_media_source_id(media_id):
@@ -585,6 +591,9 @@ class MpdDevice(MediaPlayerEntity):
                 )
                 media_id = async_process_play_media_url(self.hass, play_item.url)
 
+            if clear_queue:
+                await self._client.clear()
+
             if media_type == MediaType.PLAYLIST:
                 LOGGER.debug("Playing playlist: %s", media_id)
                 if self._attr_source_list and media_id in self._attr_source_list:
@@ -592,15 +601,28 @@ class MpdDevice(MediaPlayerEntity):
                 else:
                     self._current_playlist = None
                     LOGGER.warning("Unknown playlist name %s", media_id)
-                await self._client.clear()
                 await self._client.load(media_id)
-                await self._client.play()
             else:
-                await self._client.clear()
                 self._current_playlist = None
-                await self._client.add(media_id)
+
+                # Try to play existing song. Else add new one.
+                result = await self._client.playlistsearch("file", media_id)
+                song_id = result[0]['id'] if result else None
+                if song_id:
+                    await self._client.playid(song_id)
+                else:
+                    await self._client.add(media_id)
+                    self._fire_playlist_changed()
+                    result = await self._client.playlistsearch("file", media_id)
+                    song_id = result[0]['id'] if result else None
+
+                if song_id:
+                    self._fire_if_current_song_changed(self.media_content_id, media_id)
+
+            if start_play:
                 await self._client.play()
-            self._fire_playlist_changed()
+
+            self.async_schedule_update_ha_state()
 
     @property
     def repeat(self) -> RepeatMode:
@@ -679,7 +701,7 @@ class MpdDevice(MediaPlayerEntity):
                     case  MpdMediaType.TAGS if not media_content_id: # Get all tags
                         children=[_to_browse_media(x, mt) for x in await self._client.tagtypes()]
 
-                    case MpdMediaType.TAGS if _SEP not in media_content_id: # Get all categories by given tag
+                    case MpdMediaType.TAGS if _SEP not in (media_content_id or ""): # Get all categories by given tag
                         children=[_to_browse_media(x, mt, media_content_id) for x in await self._client.list(media_content_id)]
 
                     case MpdMediaType.ALBUM | MpdMediaType.GENRE | MpdMediaType.TITLE | MpdMediaType.ARTIST if not media_content_id:
@@ -697,6 +719,9 @@ class MpdDevice(MediaPlayerEntity):
                 if isinstance(ex, HomeAssistantError):
                     raise
                 raise HomeAssistantError(f"Failed to fetch data: {str(ex)}") from ex
+
+def _media_id_to_title(media_id:str)->str:
+    return Path(media_id or "").name
 
 def _to_browse_media(info : dict | str, media_type:MpdMediaType, parent:str|None = None, empty_content_id = False, children = []) -> BrowseMedia:
     media_class = MediaClass.DIRECTORY
@@ -728,7 +753,7 @@ def _to_browse_media(info : dict | str, media_type:MpdMediaType, parent:str|None
         media_class=media_class,
         media_content_id=content_id,
         media_content_type=media_type,
-        title=Path(content).name,
+        title=_media_id_to_title(content),
         can_play=media_class in [MediaClass.MUSIC, MediaClass.PLAYLIST],
         can_expand=media_class == MediaClass.DIRECTORY,
         children_media_class=None,
