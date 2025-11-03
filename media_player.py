@@ -172,14 +172,17 @@ class MpdDevice(MediaPlayerEntity):
             }
             self.hass.bus.async_fire(EVENT_NAME, data)
 
-    def _fire_if_current_song_changed(self, prev:str, curr:str):
+    def _fire_if_current_song_changed(self, prev:dict, curr:dict):
         if prev != curr:
+            prev = prev or {}
+            curr = curr or {}
+
             data = {
                 "entity_id": self.entity_id,
                 "entity_name": self._attr_name,
                 "type": EVENT_TYPE_CURRNENT_SONG_CHANGED,
-                "prev_media_id": prev,
-                "curr_media_id": curr,
+                "prev_media_id": prev.get('file'),
+                "curr_media_id": curr.get('file'),
                 "prev_media_title": _media_id_to_title(prev),
                 "curr_media_title": _media_id_to_title(curr),
 
@@ -273,7 +276,7 @@ class MpdDevice(MediaPlayerEntity):
                 self._status = status
 
                 song = await self._client.currentsong()
-                self._fire_if_current_song_changed((self._currentsong or {}).get("file"), (song or {}).get("file"))
+                self._fire_if_current_song_changed(self._currentsong, song)
                 self._currentsong = song
 
                 await self._async_update_media_image_hash()
@@ -594,33 +597,36 @@ class MpdDevice(MediaPlayerEntity):
             if clear_queue:
                 await self._client.clear()
 
-            if media_type == MediaType.PLAYLIST:
-                LOGGER.debug("Playing playlist: %s", media_id)
-                if self._attr_source_list and media_id in self._attr_source_list:
-                    self._current_playlist = media_id
+            try:
+                if media_type == MediaType.PLAYLIST:
+                    LOGGER.debug("Playing playlist: %s", media_id)
+                    if self._attr_source_list and media_id in self._attr_source_list:
+                        self._current_playlist = media_id
+                    else:
+                        self._current_playlist = None
+                        LOGGER.warning("Unknown playlist name %s", media_id)
+                    await self._client.load(media_id)
                 else:
                     self._current_playlist = None
-                    LOGGER.warning("Unknown playlist name %s", media_id)
-                await self._client.load(media_id)
-            else:
-                self._current_playlist = None
 
-                # Try to play existing song. Else add new one.
-                result = await self._client.playlistsearch("file", media_id)
-                song_id = result[0]['id'] if result else None
-                if song_id:
-                    await self._client.playid(song_id)
-                else:
-                    await self._client.add(media_id)
-                    self._fire_playlist_changed()
+                    # Try to play existing song. Else add new one.
                     result = await self._client.playlistsearch("file", media_id)
-                    song_id = result[0]['id'] if result else None
+                    new_song = result[0] if result else None
+                    if new_song:
+                        await self._client.playid(new_song['id'])
+                    else:
+                        await self._client.add(media_id)
+                        self._fire_playlist_changed()
+                        result = await self._client.playlistsearch("file", media_id)
+                        new_song = result[0] if result else None
 
-                if song_id:
-                    self._fire_if_current_song_changed(self.media_content_id, media_id)
+                    if new_song:
+                        self._fire_if_current_song_changed(self._currentsong, new_song)
 
-            if start_play:
-                await self._client.play()
+                if start_play:
+                    await self._client.play()
+            except Exception as ex:
+                raise HomeAssistantError(f"Failed to play media: {media_id}: {str(ex)}") from ex
 
             self.async_schedule_update_ha_state()
 
@@ -720,8 +726,16 @@ class MpdDevice(MediaPlayerEntity):
                     raise
                 raise HomeAssistantError(f"Failed to fetch data: {str(ex)}") from ex
 
-def _media_id_to_title(media_id:str)->str:
-    return Path(media_id or "").name
+def _media_id_to_title(media:dict|str|None, default:str = "")->str:
+    filename = default
+
+    if media and isinstance(media, dict):
+        if "title" in media:
+            return media['title']
+        if "file" in media:
+            filename = media['file']
+
+    return Path(filename).name
 
 def _to_browse_media(info : dict | str, media_type:MpdMediaType, parent:str|None = None, empty_content_id = False, children = []) -> BrowseMedia:
     media_class = MediaClass.DIRECTORY
@@ -753,7 +767,7 @@ def _to_browse_media(info : dict | str, media_type:MpdMediaType, parent:str|None
         media_class=media_class,
         media_content_id=content_id,
         media_content_type=media_type,
-        title=_media_id_to_title(content),
+        title=_media_id_to_title(info, content),
         can_play=media_class in [MediaClass.MUSIC, MediaClass.PLAYLIST],
         can_expand=media_class == MediaClass.DIRECTORY,
         children_media_class=None,
