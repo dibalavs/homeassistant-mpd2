@@ -185,7 +185,6 @@ class MpdDevice(MediaPlayerEntity):
                 "curr_media_id": curr.get('file'),
                 "prev_media_title": _media_id_to_title(prev),
                 "curr_media_title": _media_id_to_title(curr),
-
             }
             self.hass.bus.async_fire(EVENT_NAME, data)
 
@@ -275,9 +274,9 @@ class MpdDevice(MediaPlayerEntity):
                 self._fire_if_volume_changed((self._status or {}).get("volume", 0), (status or {}).get("volume", 0))
                 self._status = status
 
-                song = await self._client.currentsong()
-                self._fire_if_current_song_changed(self._currentsong, song)
-                self._currentsong = song
+                prev_song = self._currentsong
+                new_song = await self._client.currentsong()
+                self._currentsong = new_song
 
                 await self._async_update_media_image_hash()
 
@@ -292,6 +291,8 @@ class MpdDevice(MediaPlayerEntity):
                     self._attr_media_position = int(float(position))
 
                 await self._update_playlists()
+                self._fire_if_current_song_changed(prev_song, new_song) # Must be after update_playlist()
+
             except (mpd.ConnectionError, ValueError) as error:
                 LOGGER.debug("Error updating status: %s", error)
 
@@ -584,7 +585,7 @@ class MpdDevice(MediaPlayerEntity):
             media_id = media_id.split(_SEP)[0]
 
         clear_queue = 'enqueue' not in kwargs or kwargs['enqueue'] == MediaPlayerEnqueue.REPLACE
-        start_play = kwargs.get('enqueue', MediaPlayerEnqueue.PLAY) == MediaPlayerEnqueue.PLAY
+        start_play = self.state == MediaPlayerState.PLAYING or kwargs.get('enqueue', MediaPlayerEnqueue.PLAY) == MediaPlayerEnqueue.PLAY
 
         async with self.connection():
             if media_source.is_media_source_id(media_id):
