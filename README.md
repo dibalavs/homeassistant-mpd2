@@ -29,6 +29,11 @@ media_player:
     host: 127.0.0.1
     port: 6600  # optional, default is 6600
     password: your_password  # optional
+    volume: 0.45  # optional, float values 0..1. Default - keep volume from MPD
+    shuffle: yes  # optional, boolean values "yes", "no"
+
+    # WARNING: quotes are required! in opposite way, off will be interpreted as false
+    repeat: "all" # optional, Possible values: "all", "one", "off"
 ```
 
 ## Enhanced Features

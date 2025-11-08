@@ -52,6 +52,12 @@ EVENT_TYPE_VOLUME_CHANGED = "volume_changed" # {"prev" : <float>, "curr" : <floa
 DEFAULT_NAME = "MPD2"
 DEFAULT_PORT = 6600
 
+CONF_VOLUME = "volume"
+CONF_REPEAT = "repeat"
+CONF_SHUFFLE = "shuffle"
+
+CONF_REPEAT_VALUES = [RepeatMode.ONE.value, RepeatMode.ALL.value, RepeatMode.OFF.value]
+
 PLAYLIST_UPDATE_INTERVAL = timedelta(seconds=120)
 
 SUPPORT_MPD = (
@@ -76,6 +82,9 @@ PLATFORM_SCHEMA = MEDIA_PLAYER_PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
         vol.Optional(CONF_PASSWORD): cv.string,
         vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
+        vol.Optional(CONF_VOLUME): cv.small_float,
+        vol.Optional(CONF_SHUFFLE): cv.boolean,
+        vol.Optional(CONF_REPEAT): vol.In(CONF_REPEAT_VALUES)
     }
 )
 
@@ -121,7 +130,10 @@ async def async_setup_platform(
         config[CONF_NAME],
         config[CONF_HOST],
         config[CONF_PORT],
-        config.get(CONF_PASSWORD))
+        config.get(CONF_PASSWORD),
+        config.get(CONF_REPEAT),
+        config.get(CONF_SHUFFLE),
+        config.get(CONF_VOLUME))
     async_add_entities([mpd])
 
 
@@ -133,7 +145,8 @@ class MpdDevice(MediaPlayerEntity):
     _attr_name = None
 
     def __init__(
-        self, hass: HomeAssistant, name: str, server: str, port: int, password: str | None
+        self, hass: HomeAssistant, name: str, server: str, port: int,
+        password: str | None, repeat: RepeatMode|None, shuffle:bool|None, volume:float|None
     ) -> None:
         """Initialize the MPD device."""
         self.hass = hass
@@ -155,11 +168,29 @@ class MpdDevice(MediaPlayerEntity):
         # Track if the song changed so image doesn't have to be loaded every update.
         self._media_image_file = None
 
+        self._default_values = {}
+        self._listplaylists_enabled = True
+
         # set up MPD client
         self._client = MPDClient()
         self._client.timeout = 30
         self._client.idletimeout = 10
         self._client_lock = asyncio.Lock()
+
+        if volume is not None:
+            if not isinstance(volume, float):
+                raise HomeAssistantError(f"'volume' pararmeter has invalid value. Expected float. actual: {volume}")
+            self._default_values[CONF_VOLUME] = volume
+
+        if shuffle is not None:
+            if not isinstance(shuffle, bool):
+                raise HomeAssistantError(f"'shuffle' pararmeter has invalid value. Expected bool. actual: {shuffle}")
+            self._default_values[CONF_SHUFFLE] = shuffle
+
+        if repeat is not None:
+            if repeat not in CONF_REPEAT_VALUES:
+                raise HomeAssistantError(f"'repeat' pararmeter has invalid value. Expected one of {CONF_REPEAT_VALUES}. actual: {repeat}")
+            self._default_values[CONF_REPEAT] = repeat
 
     def _fire_if_state_changed(self, prev:MediaPlayerState, curr:MediaPlayerState):
         if prev != curr:
@@ -295,6 +326,18 @@ class MpdDevice(MediaPlayerEntity):
 
             except (mpd.ConnectionError, ValueError) as error:
                 LOGGER.debug("Error updating status: %s", error)
+
+        if self._default_values:
+            if CONF_REPEAT in self._default_values:
+                await self.async_set_repeat(self._default_values[CONF_REPEAT])
+
+            if CONF_VOLUME in self._default_values:
+                await self.async_set_volume_level(self._default_values[CONF_VOLUME])
+
+            if CONF_SHUFFLE in self._default_values:
+                await self.async_set_shuffle(self._default_values[CONF_SHUFFLE])
+
+            self._default_values = None
 
     def _to_state(self, state) -> MediaPlayerState:
         """Return the media state."""
@@ -497,10 +540,11 @@ class MpdDevice(MediaPlayerEntity):
 
             self._attr_source_list = []
             self._playlist_songs = []
-            with suppress(mpd.ConnectionError):
-                for playlist_data in await self._client.listplaylists():
-                    self._attr_source_list.append(playlist_data["playlist"])
-            self._fire_if_list_playlists_changed(prev_source_list, self._attr_source_list)
+            if self._listplaylists_enabled:
+                with suppress(mpd.ConnectionError):
+                    for playlist_data in await self._client.listplaylists():
+                        self._attr_source_list.append(playlist_data["playlist"])
+                self._fire_if_list_playlists_changed(prev_source_list, self._attr_source_list)
 
             for song in await self._client.playlist():
                 self._playlist_songs.append(song)
@@ -509,7 +553,11 @@ class MpdDevice(MediaPlayerEntity):
                     self._fire_playlist_changed()
         except mpd.CommandError as error:
             self._attr_source_list = None
-            LOGGER.warning("Playlists could not be updated: %s:", error)
+            err_val = str(error)
+            if "disabled" not in err_val:
+                LOGGER.warning("Playlists could not be updated: %s", err_val)
+            else:
+                self._listplaylists_enabled = False
 
     async def async_set_volume_level(self, volume: float) -> None:
         """Set volume of media player."""
