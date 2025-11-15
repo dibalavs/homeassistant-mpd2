@@ -33,7 +33,7 @@ from homeassistant.components.media_player import (
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PASSWORD, CONF_PORT
+from homeassistant.const import CONF_ID, CONF_HOST, CONF_NAME, CONF_PASSWORD, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
@@ -55,36 +55,42 @@ DEFAULT_PORT = 6600
 CONF_VOLUME = "volume"
 CONF_REPEAT = "repeat"
 CONF_SHUFFLE = "shuffle"
+CONF_ENABLE_VOLUME_SYNC = "enable_volume_sync"
 
 CONF_REPEAT_VALUES = [RepeatMode.ONE.value, RepeatMode.ALL.value, RepeatMode.OFF.value]
 
 PLAYLIST_UPDATE_INTERVAL = timedelta(seconds=120)
 
 SUPPORT_MPD = (
-    MediaPlayerEntityFeature.PAUSE
-    | MediaPlayerEntityFeature.PREVIOUS_TRACK
-    | MediaPlayerEntityFeature.NEXT_TRACK
-    | MediaPlayerEntityFeature.PLAY_MEDIA
-    | MediaPlayerEntityFeature.PLAY
+    MediaPlayerEntityFeature.BROWSE_MEDIA
     | MediaPlayerEntityFeature.CLEAR_PLAYLIST
+    | MediaPlayerEntityFeature.NEXT_TRACK
+    | MediaPlayerEntityFeature.PAUSE
+    | MediaPlayerEntityFeature.PLAY
+    | MediaPlayerEntityFeature.PLAY_MEDIA
+    | MediaPlayerEntityFeature.PREVIOUS_TRACK
     | MediaPlayerEntityFeature.REPEAT_SET
-    | MediaPlayerEntityFeature.SHUFFLE_SET
     | MediaPlayerEntityFeature.SEEK
+    | MediaPlayerEntityFeature.SHUFFLE_SET
     | MediaPlayerEntityFeature.STOP
     | MediaPlayerEntityFeature.TURN_OFF
     | MediaPlayerEntityFeature.TURN_ON
-    | MediaPlayerEntityFeature.BROWSE_MEDIA
+    | MediaPlayerEntityFeature.VOLUME_MUTE
+    | MediaPlayerEntityFeature.VOLUME_SET
+    | MediaPlayerEntityFeature.VOLUME_STEP
 )
 
 PLATFORM_SCHEMA = MEDIA_PLAYER_PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_HOST): cv.string,
+        vol.Optional(CONF_ID, default=""): cv.string,
         vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
         vol.Optional(CONF_PASSWORD): cv.string,
         vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
         vol.Optional(CONF_VOLUME): cv.small_float,
         vol.Optional(CONF_SHUFFLE): cv.boolean,
-        vol.Optional(CONF_REPEAT): vol.In(CONF_REPEAT_VALUES)
+        vol.Optional(CONF_REPEAT): vol.In(CONF_REPEAT_VALUES),
+        vol.Optional(CONF_ENABLE_VOLUME_SYNC, default=True): cv.boolean,
     }
 )
 
@@ -127,13 +133,15 @@ async def async_setup_platform(
 ) -> None:
     mpd = MpdDevice(
         hass,
+        config[CONF_ID],
         config[CONF_NAME],
         config[CONF_HOST],
         config[CONF_PORT],
         config.get(CONF_PASSWORD),
         config.get(CONF_REPEAT),
         config.get(CONF_SHUFFLE),
-        config.get(CONF_VOLUME))
+        config.get(CONF_VOLUME),
+        config.get(CONF_ENABLE_VOLUME_SYNC))
     async_add_entities([mpd])
 
 
@@ -145,8 +153,9 @@ class MpdDevice(MediaPlayerEntity):
     _attr_name = None
 
     def __init__(
-        self, hass: HomeAssistant, name: str, server: str, port: int,
-        password: str | None, repeat: RepeatMode|None, shuffle:bool|None, volume:float|None
+        self, hass: HomeAssistant, unique_id:str, name: str, server: str, port: int,
+        password: str | None, repeat: RepeatMode|None, shuffle:bool|None,
+        volume:float|None, enable_volume_sync:bool|None
     ) -> None:
         """Initialize the MPD device."""
         self.hass = hass
@@ -158,12 +167,18 @@ class MpdDevice(MediaPlayerEntity):
         )
         self.password = password
 
+        if unique_id:
+            self._attr_unique_id = unique_id
         self._attr_name = name
         self._status: dict[str, Any] = {}
+        self._stats: dict[str, Any] = {}
         self._currentsong = None
         self._current_playlist: str | None = None
-        self._playlist_songs: list[str] = []
         self._muted_volume = None
+        self._enable_volume_sync:bool = enable_volume_sync if enable_volume_sync is not None else True
+        self._volume_level:float|None = None # It is an issue when you manually change volume, actual change will be applied after 10 seconds after MPD update.
+                                  # Alsow when we switch on player, volume level will be restored also after 10 seconds.
+                                  # As workaround - use local copy of MPD volumes state.
         self._media_image_hash = None
         # Track if the song changed so image doesn't have to be loaded every update.
         self._media_image_file = None
@@ -238,14 +253,20 @@ class MpdDevice(MediaPlayerEntity):
         }
         self.hass.bus.async_fire(EVENT_NAME, data)
 
-    def _fire_if_volume_changed(self, prev:int, curr:int):
+    def _fire_if_volume_changed(self, prev:int|str|None, curr:int|str|None):
+        if isinstance(prev,str):
+            prev = int(prev)
+
+        if isinstance(curr,str):
+            curr = int(curr)
+
         if prev != curr:
             data = {
                 "entity_id": self.entity_id,
                 "entity_name": self._attr_name,
                 "type": EVENT_TYPE_VOLUME_CHANGED,
-                "prev": int(prev) / 100,
-                "curr": int(curr) / 100
+                "prev": int(prev) / 100 if prev is not None else None,
+                "curr": int(curr) / 100 if curr is not None else None
             }
             self.hass.bus.async_fire(EVENT_NAME, data)
 
@@ -300,16 +321,39 @@ class MpdDevice(MediaPlayerEntity):
         """Get the latest data from MPD and update the state."""
         async with self.connection():
             try:
-                status = await self._client.status()
+                funcs = [
+                    self._client.status(),
+                    self._client.stats(),
+                    self._client.currentsong()
+                ]
+
+                res = await asyncio.gather(*funcs)
+                status, stats, new_song = res[0:3]
+
+                # check state
                 self._fire_if_state_changed(self._to_state(self._status), self._to_state(status))
-                self._fire_if_volume_changed((self._status or {}).get("volume", 0), (status or {}).get("volume", 0))
+
+                # check volume
+                if self._enable_volume_sync:
+                    new_volume = (status or {}).get("volume", None)
+                    if new_volume is not None:
+                        self._fire_if_volume_changed((self._status or {}).get("volume", None), int(new_volume))
+                        self._volume_level = int(new_volume) / 100
+
+                # check current playlist
+                new_currplaylist_version = (status or {}).get("playlist", None)
+                prev_currplaylist_version = self._status.get("playlist", None)
+
                 self._status = status
+                self._stats = stats
+
 
                 prev_song = self._currentsong
-                new_song = await self._client.currentsong()
                 self._currentsong = new_song
 
                 await self._async_update_media_image_hash()
+
+                #check media time
 
                 if (position := self._status.get("elapsed")) is None:
                     position = self._status.get("time")
@@ -320,6 +364,9 @@ class MpdDevice(MediaPlayerEntity):
                 if position is not None and self._attr_media_position != position:
                     self._attr_media_position_updated_at = dt_util.utcnow()
                     self._attr_media_position = int(float(position))
+
+                if prev_currplaylist_version != new_currplaylist_version:
+                    self._fire_playlist_changed()
 
                 await self._update_playlists()
                 self._fire_if_current_song_changed(prev_song, new_song) # Must be after update_playlist()
@@ -500,23 +547,15 @@ class MpdDevice(MediaPlayerEntity):
     @property
     def volume_level(self):
         """Return the volume level."""
-        if "volume" in self._status:
-            return int(self._status["volume"]) / 100
-        return None
+        return self._volume_level
 
     @property
     def supported_features(self) -> MediaPlayerEntityFeature:
         """Flag media player features that are supported."""
         if not self._status:
-            return MediaPlayerEntityFeature(0)
+            return SUPPORT_MPD
 
         supported = SUPPORT_MPD
-        if "volume" in self._status:
-            supported |= (
-                MediaPlayerEntityFeature.VOLUME_SET
-                | MediaPlayerEntityFeature.VOLUME_STEP
-                | MediaPlayerEntityFeature.VOLUME_MUTE
-            )
         if self._attr_source_list is not None:
             supported |= MediaPlayerEntityFeature.SELECT_SOURCE
 
@@ -536,59 +575,61 @@ class MpdDevice(MediaPlayerEntity):
         """Update available MPD playlists."""
         try:
             prev_source_list = self._attr_source_list
-            prev_playlist_songs = self._playlist_songs
 
             self._attr_source_list = []
-            self._playlist_songs = []
             if self._listplaylists_enabled:
                 with suppress(mpd.ConnectionError):
                     for playlist_data in await self._client.listplaylists():
                         self._attr_source_list.append(playlist_data["playlist"])
                 self._fire_if_list_playlists_changed(prev_source_list, self._attr_source_list)
 
-            for song in await self._client.playlist():
-                self._playlist_songs.append(song)
-
-            if prev_playlist_songs != self._playlist_songs:
-                    self._fire_playlist_changed()
         except mpd.CommandError as error:
             self._attr_source_list = None
             err_val = str(error)
             if "disabled" not in err_val:
-                LOGGER.warning("Playlists could not be updated: %s", err_val)
+                LOGGER.warning("%s Playlists could not be updated: %s", self.entity_id, err_val)
             else:
+                LOGGER.warning(f"{self.entity_id} - Playlists are not supported on MPD. Skipped")
                 self._listplaylists_enabled = False
+
 
     async def async_set_volume_level(self, volume: float) -> None:
         """Set volume of media player."""
         async with self.connection():
-            prev_volume = self._status.get("volume")
-            if prev_volume is not None:
-                new_volume = int(volume * 100)
-                await self._client.setvol(new_volume)
-                self._status["volume"] = new_volume
+            new_volume_i = int(volume * 100)
+            await self._client.setvol(new_volume_i)
+            self._volume_level = volume
+
 
     async def async_volume_up(self) -> None:
         """Service to send the MPD the command for volume up."""
-        async with self.connection():
-            prev_volume = self._status.get("volume")
-            if prev_volume is not None and int(prev_volume) <= 95:
-                    new_volume = int(prev_volume) + 5
-                    self._client.setvol(new_volume)
-                    self._status["volume"] = new_volume
+
+        if self._volume_level is not None:
+            async with self.connection():
+                    prev_volume_i = int(self._volume_level * 100)
+                    if int(prev_volume_i) <= 95:
+                        new_volume_i = prev_volume_i + 5
+                        await self._client.setvol(new_volume_i)
+                        self._volume_level = new_volume_i / 100
 
 
     async def async_volume_down(self) -> None:
         """Service to send the MPD the command for volume down."""
-        async with self.connection():
-            prev_volume = self._status.get("volume")
-            if prev_volume is not None and int(prev_volume) >= 5:
-                    new_volume = int(prev_volume) - 5
-                    self._client.setvol(new_volume)
-                    self._status["volume"] = new_volume
+
+        if self._volume_level is not None:
+            async with self.connection():
+                    prev_volume_i = int(self._volume_level * 100.0)
+                    if prev_volume_i >= 5:
+                        new_volume_i = prev_volume_i - 5
+                        await self._client.setvol(new_volume_i)
+                        self._volume_level = new_volume_i / 100
+
 
     async def async_media_play(self) -> None:
         """Service to send the MPD the command for play/pause."""
+        if self._volume_level:
+             await self.async_set_volume_level(self._volume_level)
+
         async with self.connection():
             if self._status.get("state") == "pause":
                 await self._client.pause(0)
@@ -600,20 +641,24 @@ class MpdDevice(MediaPlayerEntity):
         async with self.connection():
             await self._client.pause(1)
 
+
     async def async_media_stop(self) -> None:
         """Service to send the MPD the command for stop."""
         async with self.connection():
             await self._client.stop()
+
 
     async def async_media_next_track(self) -> None:
         """Service to send the MPD the command for next track."""
         async with self.connection():
             await self._client.next()
 
+
     async def async_media_previous_track(self) -> None:
         """Service to send the MPD the command for previous track."""
         async with self.connection():
             await self._client.previous()
+
 
     async def async_mute_volume(self, mute: bool) -> None:
         """Mute. Emulated with set_volume_level."""
@@ -625,6 +670,7 @@ class MpdDevice(MediaPlayerEntity):
                 await self.async_set_volume_level(self._muted_volume)
             self._attr_is_volume_muted = mute
 
+
     async def async_play_media(
         self, media_type: MediaType | str, media_id: str, **kwargs: Any
     ) -> None:
@@ -635,6 +681,12 @@ class MpdDevice(MediaPlayerEntity):
         clear_queue = 'enqueue' not in kwargs or kwargs['enqueue'] == MediaPlayerEnqueue.REPLACE
         start_play = self.state == MediaPlayerState.PLAYING or kwargs.get('enqueue', MediaPlayerEnqueue.PLAY) == MediaPlayerEnqueue.PLAY
 
+        # NOTE: MPD can be configured without stage_file support.
+        # So it forgot about previous volume level when MPD was stopped.
+        # Need to force set current volume level.
+        if self._volume_level is not None:
+            await self.async_set_volume_level(self._volume_level)
+
         async with self.connection():
             if media_source.is_media_source_id(media_id):
                 media_type = MediaType.MUSIC
@@ -643,10 +695,10 @@ class MpdDevice(MediaPlayerEntity):
                 )
                 media_id = async_process_play_media_url(self.hass, play_item.url)
 
-            if clear_queue:
-                await self._client.clear()
-
             try:
+                if clear_queue:
+                    await self._client.clear()
+
                 if media_type == MediaType.PLAYLIST:
                     LOGGER.debug("Playing playlist: %s", media_id)
                     if self._attr_source_list and media_id in self._attr_source_list:
@@ -679,6 +731,7 @@ class MpdDevice(MediaPlayerEntity):
 
             self.async_schedule_update_ha_state()
 
+
     @property
     def repeat(self) -> RepeatMode:
         """Return current repeat mode."""
@@ -687,6 +740,7 @@ class MpdDevice(MediaPlayerEntity):
                 return RepeatMode.ONE
             return RepeatMode.ALL
         return RepeatMode.OFF
+
 
     async def async_set_repeat(self, repeat: RepeatMode) -> None:
         """Set repeat mode."""
@@ -718,9 +772,13 @@ class MpdDevice(MediaPlayerEntity):
 
     async def async_turn_on(self) -> None:
         """Service to send the MPD the command to start playing."""
+        if self._volume_level:
+             await self.async_set_volume_level(self._volume_level)
+
         async with self.connection():
             await self._client.play()
             await self._update_playlists(no_throttle=True)
+
 
     async def async_clear_playlist(self) -> None:
         """Clear players playlist."""
