@@ -35,12 +35,14 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.const import CONF_ID, CONF_HOST, CONF_NAME, CONF_PASSWORD, CONF_PORT
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import config_validation as cv, entity_platform
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import Throttle, dt as dt_util
 
 from .const import DOMAIN, LOGGER
+
+PLAYLIST_EXTENSIONS = ['.m3u', '.m3u8', '.pls', '.xspf', '.wpl']
 
 EVENT_NAME = f"{DOMAIN}_event"
 EVENT_TYPE_STATE_CHANGED = "state_changed" # {"prev" : <MediaPlayerState>, "curr" : <MediaPlayerState>}
@@ -48,6 +50,7 @@ EVENT_TYPE_CURRNENT_SONG_CHANGED = "current_song_changed" # {"prev" : <str>, "cu
 EVENT_TYPE_PLAYLIST_CHANGED = "playlist_changed" # No playload
 EVENT_TYPE_LIST_PLAYLISTS_CHANGED = "list_playlists_changed" # {"prev" : <list[str]>, "curr" : <list[str]>}
 EVENT_TYPE_VOLUME_CHANGED = "volume_changed" # {"prev" : <float>, "curr" : <float>}
+EVENT_TYPE_DATABASE_UPDATED = "database_updated" # {"prev" : <timestamp>, "curr" : <timestamp>}
 
 DEFAULT_NAME = "MPD2"
 DEFAULT_PORT = 6600
@@ -58,6 +61,8 @@ CONF_SHUFFLE = "shuffle"
 CONF_ENABLE_VOLUME_SYNC = "enable_volume_sync"
 
 CONF_REPEAT_VALUES = [RepeatMode.ONE.value, RepeatMode.ALL.value, RepeatMode.OFF.value]
+
+SERVICE_MPD_UPDATE = "mpd_update"
 
 PLAYLIST_UPDATE_INTERVAL = timedelta(seconds=120)
 
@@ -131,6 +136,14 @@ async def async_setup_platform(
     async_add_entities: AddEntitiesCallback,
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
+
+    platform = entity_platform.async_get_current_platform()
+    platform.async_register_entity_service(
+        SERVICE_MPD_UPDATE,
+        None,
+        "async_mpd_update",
+    )
+
     mpd = MpdDevice(
         hass,
         config[CONF_ID],
@@ -142,6 +155,7 @@ async def async_setup_platform(
         config.get(CONF_SHUFFLE),
         config.get(CONF_VOLUME),
         config.get(CONF_ENABLE_VOLUME_SYNC))
+
     async_add_entities([mpd])
 
 
@@ -253,6 +267,21 @@ class MpdDevice(MediaPlayerEntity):
         }
         self.hass.bus.async_fire(EVENT_NAME, data)
 
+    def _fire_if_db_updated(self, prev:dict, curr:dict):
+        prev_stamp = prev.get("db_update")
+        curr_stamp = curr.get("db_update")
+
+        if prev_stamp != curr_stamp:
+            data = {
+                "entity_id": self.entity_id,
+                "entity_name": self._attr_name,
+                "type": EVENT_TYPE_DATABASE_UPDATED,
+                "prev": prev_stamp,
+                "curr": curr_stamp
+            }
+            self.hass.bus.async_fire(EVENT_NAME, data)
+
+
     def _fire_if_volume_changed(self, prev:int|str|None, curr:int|str|None):
         if isinstance(prev,str):
             prev = int(prev)
@@ -317,6 +346,10 @@ class MpdDevice(MediaPlayerEntity):
                 with suppress(mpd.ConnectionError):
                     self._client.disconnect()
 
+    async def async_mpd_update(self) -> None:
+        async with self.connection():
+            await self._client.update()
+
     async def async_update(self) -> None:
         """Get the latest data from MPD and update the state."""
         async with self.connection():
@@ -332,6 +365,7 @@ class MpdDevice(MediaPlayerEntity):
 
                 # check state
                 self._fire_if_state_changed(self._to_state(self._status), self._to_state(status))
+                self._fire_if_db_updated(self._stats, stats)
 
                 # check volume
                 if self._enable_volume_sync:
@@ -694,6 +728,9 @@ class MpdDevice(MediaPlayerEntity):
                     self.hass, media_id, self.entity_id
                 )
                 media_id = async_process_play_media_url(self.hass, play_item.url)
+
+            if Path(media_id).suffix.lower() in PLAYLIST_EXTENSIONS:
+                media_type = MediaType.PLAYLIST
 
             try:
                 if clear_queue:

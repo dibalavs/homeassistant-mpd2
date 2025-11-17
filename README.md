@@ -27,13 +27,17 @@ media_player:
   - platform: mpd2
     name: my_mpd2
     host: 127.0.0.1
-    port: 6600  # optional, default is 6600
+    id:          # optional, unquie entity identifier
+    port: 6600   # optional, default is 6600
     password: your_password  # optional
     volume: 0.45  # optional, float values 0..1. Default - keep volume from MPD
     shuffle: yes  # optional, boolean values "yes", "no"
 
     # WARNING: quotes are required! in opposite way, off will be interpreted as false
     repeat: "all" # optional, Possible values: "all", "one", "off"
+
+    # WARNING: Use this option only if MPD does not support state_file feature.
+    enable_volume_sync: "on" # optional. Do volume level synchronization from MPD service
 ```
 
 ## Enhanced Features
@@ -174,6 +178,20 @@ data = {
 }
 ```
 
+- `database_updated` - When database song's database was updated (timestamp changed)
+
+Additional data payload from event:
+
+```
+data = {
+    "entity_id": <entity id>,
+    "entity_name": <entity name>,
+    "type": database_updated,
+    "prev": prev_timestamp,
+    "curr": curr_timestamp
+}
+```
+
 Example Automation:
 
 ```
@@ -190,4 +208,18 @@ actions:
       entity_id: input_select.mpd2_select_songs
     data:
       option: "{{ trigger.event.data.curr_media_title }} ----- {{ trigger.event.data.curr_media_id }} "
+```
+
+### Custom actions
+
+#### mpd2.mpd_update
+
+Updates datbase and rescan all songs in music directory.
+
+Example:
+
+```
+action: mpd2.mpd_update
+target:
+  entity_id: media_player.my_mpd2
 ```

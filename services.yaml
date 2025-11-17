@@ -1,0 +1,5 @@
+mpd_update:
+  target:
+    entity:
+      integration: mpd2
+      domain: media_player
